@@ -14,7 +14,7 @@
     "start": "next start -p 3000",
     "typecheck": "tsc --noEmit",
     "lint": "next lint",
-    "test:calendar-layout": "tsc --target ES2022 --module commonjs --moduleResolution node --esModuleInterop --strict --skipLibCheck --types node --rootDir . --outDir .test-build app/lib/calendar-layout.ts tests/calendar-layout.test.ts && node --test .test-build/tests/calendar-layout.test.js"
+    "test:calendar-layout": "tsc --target ES2022 --module commonjs --moduleResolution node --esModuleInterop --strict --skipLibCheck --types node --rootDir . --outDir .test-build app/lib/calendar-layout.ts app/lib/calendar-now.ts tests/calendar-layout.test.ts tests/calendar-now.test.ts && node --test .test-build/tests/calendar-layout.test.js .test-build/tests/calendar-now.test.js"
   },
   "dependencies": {
     "@radix-ui/react-avatar": "^1.2.6",

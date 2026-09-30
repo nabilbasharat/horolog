@@ -1,6 +1,6 @@
 "use client"
 
-import React, { useState, useCallback, useMemo } from "react"
+import React, { useState, useCallback, useMemo, useEffect } from "react"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
@@ -34,6 +34,7 @@ import {
   CALENDAR_PX_PER_HOUR,
   layoutEventsForDay,
 } from "@/app/lib/calendar-layout"
+import { getNowIndicatorPosition, subscribeToMinuteUpdates } from "@/app/lib/calendar-now"
 
 export interface Event {
   id: string
@@ -1459,7 +1460,14 @@ function DayView({
   getColorClasses: (color: string) => { bg: string; text: string }
 }) {
   const hours = Array.from({ length: 24 }, (_, i) => i)
+  const [now, setNow] = useState<Date | null>(null)
+  const nowIndicator = now ? getNowIndicatorPosition(currentDate, now) : null
   const positionedEvents = layoutEventsForDay(events, currentDate)
+
+  useEffect(() => {
+    setNow(new Date())
+    return subscribeToMinuteUpdates(() => setNow(new Date()))
+  }, [])
 
   const handleDrop = (dropEvent: React.DragEvent<HTMLDivElement>) => {
     dropEvent.preventDefault()
@@ -1522,6 +1530,22 @@ function DayView({
               />
             </div>
           ))}
+          {nowIndicator && (
+            <div
+              aria-label={`Current time ${nowIndicator.label}`}
+              data-testid="planner-now-line"
+              role="img"
+              className="pointer-events-none absolute inset-x-0 z-20"
+              style={{ top: nowIndicator.top }}
+            >
+              <div className="relative h-[2px] w-full bg-destructive shadow-[0_0_0_1px_rgba(255,255,255,0.5)]">
+                <span className="absolute -left-[5px] -top-[4px] h-[10px] w-[10px] rounded-full border-2 border-background bg-destructive shadow-sm" />
+                <span className="absolute -left-[4.75rem] -top-[7px] rounded-sm bg-background px-1 py-0.5 text-[10px] font-semibold leading-none text-destructive shadow-sm">
+                  {nowIndicator.label}
+                </span>
+              </div>
+            </div>
+          )}
         </div>
       </div>
     </Card>

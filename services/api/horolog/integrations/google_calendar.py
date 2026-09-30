@@ -6,16 +6,15 @@
 once fetched.
 
 `GoogleCalendarWriter` is the other direction — pushing the plan back out as
-real events, on a dedicated secondary calendar rather than the primary one.
-See `api.py`'s `_push_calendar` for why: a secondary calendar is structurally
-invisible to `GoogleCalendarProvider.fetch` (which reads `calendars/primary`),
-so what Horolog writes can never come back around as busy time it then
-schedules around.
+real events, on a dedicated secondary calendar. Google imports use the saved
+calendar selection and always exclude that write-back calendar.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -23,15 +22,13 @@ import httpx
 from horolog.domain.events import BusyInterval
 from horolog.providers import SyncError, to_interval
 
-_EVENTS_URL = "https://www.googleapis.com/calendar/v3/calendars/primary/events"
 _CALENDAR_LIST_URL = "https://www.googleapis.com/calendar/v3/users/me/calendarList"
 _CALENDARS_URL = "https://www.googleapis.com/calendar/v3/calendars"
 CALENDAR_NAME = "Horolog"
 
 MAX_PAGES = 10
-"""Bounds both `fetch` and `ensure_calendar`'s pagination — a hard cap on
-pages, not on events/calendars found, matching the convention already used
-for tracker syncs (see `integrations/notion.py`)."""
+"""Bounds provider pagination — a hard cap on pages, matching the convention
+already used for tracker syncs (see `integrations/notion.py`)."""
 
 
 def _parse(value: dict[str, str], zone: ZoneInfo) -> datetime | None:
@@ -45,15 +42,103 @@ def _parse(value: dict[str, str], zone: ZoneInfo) -> datetime | None:
     return None
 
 
+@dataclass(frozen=True)
+class GoogleCalendar:
+    """A calendar visible through Google Calendar's `calendarList` API."""
+
+    id: str
+    summary: str
+    primary: bool
+    writeback: bool
+
+
+async def list_calendars(access_token: str) -> list[GoogleCalendar]:
+    """Return every calendar visible to the connected Google account.
+
+    Horolog's writer uses the same name to find the secondary calendar it owns;
+    only an owned calendar with that name is classified as the write-back
+    destination. Import code excludes it even if a caller submits it as selected.
+    """
+    calendars: list[GoogleCalendar] = []
+    page_token: str | None = None
+    seen_page_tokens: set[str] = set()
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            while True:
+                if page_token:
+                    if page_token in seen_page_tokens:
+                        raise SyncError("Google returned a repeated calendar-list page token")
+                    seen_page_tokens.add(page_token)
+                params: dict[str, str | int] = {"maxResults": 250}
+                if page_token:
+                    params["pageToken"] = page_token
+                response = await client.get(
+                    _CALENDAR_LIST_URL,
+                    headers={"Authorization": f"Bearer {access_token}"},
+                    params=params,
+                )
+                if response.status_code in (401, 403):
+                    raise SyncError(
+                        "Google rejected the calendar-list request — reconnect in Calendars & Sync"
+                    )
+                response.raise_for_status()
+                body = response.json()
+                for item in body.get("items", []):
+                    ident = item.get("id")
+                    if not ident:
+                        continue
+                    summary = str(item.get("summary") or ident)
+                    owned = item.get("accessRole") == "owner"
+                    calendars.append(
+                        GoogleCalendar(
+                            id=str(ident),
+                            summary=summary,
+                            primary=bool(item.get("primary")),
+                            writeback=owned and summary == CALENDAR_NAME,
+                        )
+                    )
+                page_token = body.get("nextPageToken")
+                if not page_token:
+                    break
+    except httpx.HTTPError as exc:
+        raise SyncError(f"could not reach Google Calendar: {exc}") from exc
+    return calendars
+
+
 class GoogleCalendarProvider:
-    def __init__(self, access_token: str, zone: ZoneInfo) -> None:
+    def __init__(
+        self,
+        access_token: str,
+        zone: ZoneInfo,
+        calendar_ids: list[str] | None = None,
+        excluded_calendar_ids: set[str] | None = None,
+    ) -> None:
         self._token = access_token
         self._zone = zone
+        # Preserve the old provider contract for direct callers. The API uses
+        # `list_calendars()` and supplies the persistent account selection.
+        self._calendar_ids = calendar_ids if calendar_ids is not None else ["primary"]
+        self._excluded_calendar_ids = excluded_calendar_ids or set()
 
     async def fetch(self, origin: datetime, horizon_days: int) -> list[BusyInterval]:
+        calendar_ids = [
+            calendar_id
+            for calendar_id in dict.fromkeys(self._calendar_ids)
+            if calendar_id not in self._excluded_calendar_ids
+        ]
+        out: list[BusyInterval] = []
+        for calendar_id in calendar_ids:
+            out.extend(await self._fetch_calendar(calendar_id, origin, horizon_days))
+        return out
+
+    async def _fetch_calendar(
+        self, calendar_id: str, origin: datetime, horizon_days: int
+    ) -> list[BusyInterval]:
         end = origin + timedelta(days=horizon_days)
         out: list[BusyInterval] = []
         page_token: str | None = None
+        encoded_id = quote(calendar_id, safe="")
+        url = f"https://www.googleapis.com/calendar/v3/calendars/{encoded_id}/events"
         try:
             async with httpx.AsyncClient(timeout=20.0) as client:
                 for _ in range(MAX_PAGES):
@@ -67,7 +152,7 @@ class GoogleCalendarProvider:
                     if page_token:
                         params["pageToken"] = page_token
                     response = await client.get(
-                        _EVENTS_URL,
+                        url,
                         headers={"Authorization": f"Bearer {self._token}"},
                         params=params,
                     )
@@ -90,7 +175,7 @@ class GoogleCalendarProvider:
                         if start is None or finish is None:
                             continue
                         interval = to_interval(
-                            f"google-{item.get('id', index)}",
+                            f"google-{calendar_id}-{item.get('id', index)}",
                             item.get("summary", "Busy"),
                             start,
                             finish,

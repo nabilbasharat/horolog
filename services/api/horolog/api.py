@@ -25,6 +25,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from pydantic import AfterValidator, BaseModel, Field
 from sqlalchemy import delete, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette.sse import EventSourceResponse
 
@@ -33,6 +34,7 @@ from horolog.analytics import Analytics, analyse
 from horolog.capture import capture, to_payload
 from horolog.db import (
     BusyRow,
+    GoogleCalendarSelectionRow,
     IntentRow,
     SyncedBlockRow,
     init_db,
@@ -53,7 +55,12 @@ from horolog.domain.time import (
 )
 from horolog.integrations.clickup import ClickUpError, fetch_clickup_tasks
 from horolog.integrations.github import GithubError, fetch_github_issues
-from horolog.integrations.google_calendar import GoogleCalendarProvider, GoogleCalendarWriter
+from horolog.integrations.google_calendar import (
+    GoogleCalendar,
+    GoogleCalendarProvider,
+    GoogleCalendarWriter,
+    list_calendars as list_google_calendars,
+)
 from horolog.integrations.jira import JiraError, fetch_jira_issues
 from horolog.integrations.linear import LinearError, fetch_linear_issues
 from horolog.integrations.notion import NotionError, fetch_notion_tasks
@@ -818,13 +825,13 @@ async def sync_jira(body: TokenSyncIn, db: AsyncSession = Depends(session)) -> d
 
 @app.post("/api/sync/google")
 async def sync_google(db: AsyncSession = Depends(session)) -> dict[str, int]:
-    """Mirror real Google Calendar events for the connected account.
+    """Mirror selected Google Calendar events for the connected account.
 
     No body: the access token lives server-side (`/api/auth/google` put it
     there), never in a request from the browser.
     """
     token = await _resolve_credential(db, "google", "")
-    provider = GoogleCalendarProvider(token, settings().zone)
+    provider = await _google_calendar_provider(db, token)
     return await _mirror(db, provider, "google")
 
 
@@ -834,6 +841,10 @@ async def sync_outlook(db: AsyncSession = Depends(session)) -> dict[str, int]:
     token = await _resolve_credential(db, "outlook", "")
     provider = OutlookCalendarProvider(token, settings().zone)
     return await _mirror(db, provider, "outlook")
+
+
+class GoogleCalendarSelectionIn(BaseModel):
+    calendar_ids: list[str]
 
 
 class CalendarPushIn(BaseModel):
@@ -860,6 +871,56 @@ async def push_calendar(
 # --------------------------------------------------------------------------
 # OAuth connections
 # --------------------------------------------------------------------------
+
+
+@app.get("/api/google/calendars")
+async def google_calendars(db: AsyncSession = Depends(session)) -> dict[str, Any]:
+    """List the connected account's calendars with the stored import selection."""
+    token = await _resolve_credential(db, "google", "")
+    calendars = await _load_google_calendars(token)
+    selected = set(await _google_selection_ids(db, calendars))
+    return {
+        "calendars": [
+            {
+                "id": calendar.id,
+                "summary": calendar.summary,
+                "primary": calendar.primary,
+                "writeback": calendar.writeback,
+                "selected": calendar.id in selected and not calendar.writeback,
+            }
+            for calendar in calendars
+        ]
+    }
+
+
+@app.put("/api/google/calendars")
+async def save_google_calendars(
+    body: GoogleCalendarSelectionIn, db: AsyncSession = Depends(session)
+) -> dict[str, Any]:
+    """Persist selected calendar IDs; the Horolog write-back calendar is never importable."""
+    token = await _resolve_credential(db, "google", "")
+    calendars = await _load_google_calendars(token)
+    visible = {calendar.id: calendar for calendar in calendars}
+    unknown = set(body.calendar_ids) - visible.keys()
+    if unknown:
+        raise HTTPException(status_code=422, detail="one or more Google calendars are unavailable")
+
+    selected = list(dict.fromkeys(body.calendar_ids))
+    selected = [ident for ident in selected if not visible[ident].writeback]
+    await _save_google_selection_ids(db, selected)
+    selected_ids = set(selected)
+    return {
+        "calendars": [
+            {
+                "id": calendar.id,
+                "summary": calendar.summary,
+                "primary": calendar.primary,
+                "writeback": calendar.writeback,
+                "selected": calendar.id in selected_ids and not calendar.writeback,
+            }
+            for calendar in calendars
+        ]
+    }
 
 
 @app.get("/api/connections")
@@ -1165,12 +1226,12 @@ async def _sync_connected_calendars(db: AsyncSession) -> None:
         token = await oauth.valid_access_token(db, settings(), provider_name)
         if not token:
             continue
-        provider: CalendarProvider = (
-            GoogleCalendarProvider(token, settings().zone)
-            if provider_name == "google"
-            else OutlookCalendarProvider(token, settings().zone)
-        )
         try:
+            provider: CalendarProvider = (
+                await _google_calendar_provider(db, token)
+                if provider_name == "google"
+                else OutlookCalendarProvider(token, settings().zone)
+            )
             await _mirror(db, provider, provider_name)
         except Exception as exc:  # see docstring: a scheduled tick must never kill the loop
             print(f"background sync: {provider_name} failed: {exc}", file=sys.stderr)
@@ -1209,6 +1270,75 @@ async def _sync_loop() -> None:
         async with asynccontextmanager(session)() as db:
             await _sync_connected_calendars(db)
             await _push_connected_calendars(db)
+
+
+async def _load_google_calendars(token: str) -> list[GoogleCalendar]:
+    try:
+        return await list_google_calendars(token)
+    except SyncError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+async def _save_google_selection_ids(db: AsyncSession, calendar_ids: list[str]) -> None:
+    row = await db.get(GoogleCalendarSelectionRow, 1)
+    if row is None:
+        row = GoogleCalendarSelectionRow(id=1, calendar_ids=calendar_ids)
+        db.add(row)
+        try:
+            await db.commit()
+            return
+        except IntegrityError:
+            # A concurrent first selection may have initialized the row.
+            await db.rollback()
+            row = await db.get(GoogleCalendarSelectionRow, 1)
+            if row is None:
+                raise
+    row.calendar_ids = calendar_ids
+    await db.commit()
+
+
+async def _google_selection_ids(
+    db: AsyncSession, calendars: list[GoogleCalendar]
+) -> list[str]:
+    """Load the persistent selection, creating a primary-calendar default once."""
+    row = await db.get(GoogleCalendarSelectionRow, 1)
+    if row is None:
+        primary = next((calendar.id for calendar in calendars if calendar.primary), "primary")
+        row = GoogleCalendarSelectionRow(id=1, calendar_ids=[primary])
+        db.add(row)
+        try:
+            await db.commit()
+        except IntegrityError:
+            # Page load after OAuth and the post-connect sync can race to
+            # initialize this singleton row; use whichever request won.
+            await db.rollback()
+            row = await db.get(GoogleCalendarSelectionRow, 1)
+            if row is None:
+                raise
+
+    visible = {calendar.id: calendar for calendar in calendars}
+    selected = [
+        ident
+        for ident in dict.fromkeys(row.calendar_ids)
+        if (ident in visible and not visible[ident].writeback)
+        or (not calendars and ident == "primary")
+    ]
+    if selected != row.calendar_ids:
+        row.calendar_ids = selected
+        await db.commit()
+    return selected
+
+
+async def _google_calendar_provider(db: AsyncSession, token: str) -> GoogleCalendarProvider:
+    calendars = await _load_google_calendars(token)
+    selected = await _google_selection_ids(db, calendars)
+    writeback_ids = {calendar.id for calendar in calendars if calendar.writeback}
+    return GoogleCalendarProvider(
+        token,
+        settings().zone,
+        calendar_ids=selected,
+        excluded_calendar_ids=writeback_ids,
+    )
 
 
 async def _mirror(db: AsyncSession, provider: CalendarProvider, source: str) -> dict[str, int]:

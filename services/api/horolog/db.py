@@ -1,6 +1,6 @@
 """Persistence.
 
-Three tables. Plans are not one of them in the usual sense: a plan is derived,
+Plans are not one of the primary records in the usual sense: a plan is derived,
 and deriving it costs single-digit milliseconds, so it is recomputed rather than
 stored as rows. The previous plan *is* kept — as one JSON blob — because the
 placement engine needs it to stay stable across re-solves.
@@ -67,6 +67,15 @@ class PlanRow(Base):
     saved_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC)
     )
+
+
+class GoogleCalendarSelectionRow(Base):
+    """The calendar IDs selected for Google imports in this single-user app."""
+
+    __tablename__ = "google_calendar_selection"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    calendar_ids: Mapped[list[str]] = mapped_column(JSON)
 
 
 class OAuthTokenRow(Base):

@@ -25,7 +25,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from horolog import oauth
 from horolog.api import _push_calendar, app
-from horolog.db import BusyRow, OAuthTokenRow, SyncedBlockRow, init_db, session
+from horolog.db import (
+    BusyRow,
+    GoogleCalendarSelectionRow,
+    OAuthTokenRow,
+    SyncedBlockRow,
+    init_db,
+    session,
+)
 from horolog.integrations import clickup, github, jira, notion, todoist
 from horolog.integrations.google_calendar import GoogleCalendarProvider
 from horolog.integrations.outlook_calendar import OutlookCalendarProvider
@@ -57,6 +64,7 @@ async def client() -> AsyncIterator[AsyncClient]:
         db = await anext(gen)
         await db.execute(delete(BusyRow))
         await db.execute(delete(SyncedBlockRow))
+        await db.execute(delete(GoogleCalendarSelectionRow))
         await db.commit()
         await gen.aclose()
         yield http
@@ -852,7 +860,12 @@ async def test_google_sync_mirrors_real_events_into_busy(
         ]
     }
 
-    def handler(_: httpx.Request) -> httpx.Response:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/calendar/v3/users/me/calendarList":
+            return httpx.Response(
+                200,
+                json={"items": [{"id": "primary", "summary": "Main", "primary": True}]},
+            )
         return httpx.Response(200, json=body)
 
     mock_http(handler)
@@ -862,6 +875,126 @@ async def test_google_sync_mirrors_real_events_into_busy(
 
     plan = (await client.get("/api/plan")).json()
     assert any(b["source"] == "google" and "Board meeting" in b["label"] for b in plan["busy"])
+
+
+@pytest.mark.asyncio
+async def test_google_calendar_list_defaults_primary_and_follows_pagination(
+    client: AsyncClient, mock_http: Callable[..., None], db: AsyncSession
+) -> None:
+    await oauth.save_token(db, "google", {"access_token": "tok"})
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/calendar/v3/users/me/calendarList"
+        if request.url.params.get("pageToken") == "page-2":
+            return httpx.Response(
+                200,
+                json={"items": [{"id": "work", "summary": "Work", "accessRole": "reader"}]},
+            )
+        return httpx.Response(
+            200,
+            json={
+                "items": [
+                    {"id": "primary", "summary": "Main", "primary": True},
+                    {"id": "horolog", "summary": "Horolog", "accessRole": "owner"},
+                ],
+                "nextPageToken": "page-2",
+            },
+        )
+
+    mock_http(handler)
+    response = await client.get("/api/google/calendars")
+    assert response.status_code == 200
+    calendars = {calendar["id"]: calendar for calendar in response.json()["calendars"]}
+    assert set(calendars) == {"primary", "work", "horolog"}
+    assert calendars["primary"]["selected"] is True
+    assert calendars["work"]["selected"] is False
+    assert calendars["horolog"]["writeback"] is True
+    assert calendars["horolog"]["selected"] is False
+
+
+@pytest.mark.asyncio
+async def test_google_calendar_selection_persists_in_database(
+    client: AsyncClient, mock_http: Callable[..., None], db: AsyncSession
+) -> None:
+    await oauth.save_token(db, "google", {"access_token": "tok"})
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "items": [
+                    {"id": "primary", "summary": "Main", "primary": True},
+                    {"id": "work", "summary": "Work", "accessRole": "reader"},
+                ]
+            },
+        )
+
+    mock_http(handler)
+    initial = await client.get("/api/google/calendars")
+    assert [c["id"] for c in initial.json()["calendars"] if c["selected"]] == ["primary"]
+
+    saved = await client.put("/api/google/calendars", json={"calendar_ids": ["work"]})
+    assert saved.status_code == 200
+    assert [c["id"] for c in saved.json()["calendars"] if c["selected"]] == ["work"]
+
+    reread = await client.get("/api/google/calendars")
+    assert [c["id"] for c in reread.json()["calendars"] if c["selected"]] == ["work"]
+    selection = await db.get(GoogleCalendarSelectionRow, 1)
+    assert selection is not None and selection.calendar_ids == ["work"]
+
+
+@pytest.mark.asyncio
+async def test_google_sync_merges_selected_calendars_and_excludes_writeback(
+    client: AsyncClient, mock_http: Callable[..., None], db: AsyncSession
+) -> None:
+    await oauth.save_token(db, "google", {"access_token": "tok"})
+    base_day = datetime.now(UTC) + timedelta(days=1)
+    calendars = [
+        {"id": "primary", "summary": "Main", "primary": True},
+        {"id": "work", "summary": "Work", "accessRole": "reader"},
+        {"id": "horolog", "summary": "Horolog", "accessRole": "owner"},
+    ]
+    fetched: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/calendar/v3/users/me/calendarList":
+            return httpx.Response(200, json={"items": calendars})
+        fetched.append(request.url.path)
+        calendar_id = request.url.path.split("/")[4]
+        summary = {"primary": "Personal meeting", "work": "Work meeting"}.get(
+            calendar_id, "Write-back event"
+        )
+        return httpx.Response(
+            200,
+            json={
+                "items": [
+                    {
+                        "id": "same-google-event-id",
+                        "summary": summary,
+                        "start": {"dateTime": base_day.replace(hour=14).isoformat()},
+                        "end": {"dateTime": base_day.replace(hour=15).isoformat()},
+                    }
+                ]
+            },
+        )
+
+    mock_http(handler)
+    saved = await client.put(
+        "/api/google/calendars", json={"calendar_ids": ["primary", "work", "horolog"]}
+    )
+    assert saved.status_code == 200
+    assert not next(c for c in saved.json()["calendars"] if c["id"] == "horolog")["selected"]
+
+    synced = await client.post("/api/sync/google")
+    assert synced.status_code == 200
+    assert synced.json()["events"] == 2
+    assert set(fetched) == {
+        "/calendar/v3/calendars/primary/events",
+        "/calendar/v3/calendars/work/events",
+    }
+    plan = (await client.get("/api/plan")).json()
+    labels = {busy["label"] for busy in plan["busy"] if busy["source"] == "google"}
+    assert labels == {"Personal meeting", "Work meeting"}
 
 
 # --------------------------------------------------------------- background sync
@@ -1023,7 +1156,13 @@ class _FakeGoogleBackend:
         body = json.loads(request.content) if request.content else {}
 
         if path == "/calendar/v3/users/me/calendarList" and method == "GET":
-            items = [{"id": cid, "summary": name} for cid, name in self.calendars.items()]
+            items = [
+                {"id": "primary", "summary": "Main", "primary": True, "accessRole": "owner"},
+                *(
+                    {"id": cid, "summary": name, "accessRole": "owner"}
+                    for cid, name in self.calendars.items()
+                ),
+            ]
             return httpx.Response(200, json={"items": items})
         if path == "/calendar/v3/calendars" and method == "POST":
             cid = self._next_id("cal")

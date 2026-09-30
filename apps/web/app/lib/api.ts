@@ -280,6 +280,23 @@ export const calendarPush = {
     }),
 };
 
+export interface GoogleCalendar {
+  id: string;
+  summary: string;
+  primary: boolean;
+  writeback: boolean;
+  selected: boolean;
+}
+
+export const googleCalendarSelection = {
+  list: () => request<{ calendars: GoogleCalendar[] }>("/api/google/calendars"),
+  save: (calendar_ids: string[]) =>
+    request<{ calendars: GoogleCalendar[] }>("/api/google/calendars", {
+      method: "PUT",
+      body: JSON.stringify({ calendar_ids }),
+    }),
+};
+
 export const connections = {
   /** Which providers have a live, usable OAuth connection right now. */
   list: () => request<Record<Provider, boolean>>("/api/connections"),

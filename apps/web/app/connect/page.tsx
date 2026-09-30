@@ -2,7 +2,16 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { Shell } from "@/app/components/Shell";
-import { api, calendarPush, connections, sync, type Plan, type Provider } from "@/app/lib/api";
+import {
+  api,
+  calendarPush,
+  connections,
+  googleCalendarSelection,
+  sync,
+  type GoogleCalendar,
+  type Plan,
+  type Provider,
+} from "@/app/lib/api";
 import {
   AlertCircle,
   Calendar,
@@ -91,6 +100,7 @@ const TRACKER_PROVIDERS: {
 export default function Connect() {
   const [plan, setPlan] = useState<Plan | null>(null);
   const [connected, setConnected] = useState<Record<string, boolean>>({});
+  const [googleCalendars, setGoogleCalendars] = useState<GoogleCalendar[] | null>(null);
   const [icsUrl, setIcsUrl] = useState("");
   const [dav, setDav] = useState({ url: "", username: "", password: "" });
   const [trackerKeys, setTrackerKeys] = useState<Record<string, string>>({});
@@ -111,10 +121,22 @@ export default function Connect() {
     } catch (caught) {
       failure = caught instanceof Error ? caught.message : "Could not reach the scheduler.";
     }
+    let googleConnected = false;
     try {
-      setConnected(await connections.list());
+      const connectionState = await connections.list();
+      setConnected(connectionState);
+      googleConnected = connectionState.google;
     } catch (caught) {
       failure ??= caught instanceof Error ? caught.message : "Could not reach the scheduler.";
+    }
+    if (googleConnected) {
+      try {
+        setGoogleCalendars((await googleCalendarSelection.list()).calendars);
+      } catch (caught) {
+        failure ??= caught instanceof Error ? caught.message : "Could not load Google calendars.";
+      }
+    } else {
+      setGoogleCalendars(null);
     }
     setLoadError(failure);
   }, []);
@@ -175,6 +197,27 @@ export default function Connect() {
       await load();
     } catch (caught) {
       setResult({ ok: false, message: caught instanceof Error ? caught.message : "Sync failed." });
+    } finally {
+      setPending(null);
+    }
+  }
+
+  async function updateGoogleCalendar(calendarId: string, checked: boolean) {
+    if (!googleCalendars) return;
+    const selected = googleCalendars
+      .filter((calendar) => calendar.selected && calendar.id !== calendarId)
+      .map((calendar) => calendar.id);
+    if (checked) selected.push(calendarId);
+
+    setPending("google-calendars");
+    setResult(null);
+    try {
+      setGoogleCalendars((await googleCalendarSelection.save(selected)).calendars);
+    } catch (caught) {
+      setResult({
+        ok: false,
+        message: caught instanceof Error ? caught.message : "Could not save the calendar selection.",
+      });
     } finally {
       setPending(null);
     }
@@ -361,6 +404,51 @@ export default function Connect() {
               </code>{" "}
               and reconnect the account above once to grant write access.
             </p>
+
+            {connected.google && (
+              <div className="border-t border-black/[0.06] pt-5">
+                <div className="mb-1 text-[13.5px] font-semibold text-fg">
+                  Google calendars to import
+                </div>
+                <p className="mb-3 text-[12px] leading-relaxed text-fg-muted">
+                  Choose which calendars Horolog checks for busy events. Your primary calendar is
+                  selected by default. The Horolog write-back calendar is always excluded.
+                </p>
+                {googleCalendars === null ? (
+                  <p className="text-[13px] text-fg-muted">Loading calendars…</p>
+                ) : googleCalendars.length === 0 ? (
+                  <p className="text-[13px] text-fg-muted">No Google calendars were found.</p>
+                ) : (
+                  <div className="space-y-1 rounded-xl border border-black/[0.07] bg-white p-2">
+                    {googleCalendars.map((calendar) => (
+                      <label
+                        key={calendar.id}
+                        className={`flex items-center gap-3 rounded-lg px-3 py-2.5 text-[13px] ${
+                          calendar.writeback ? "text-fg-muted" : "text-fg"
+                        }`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={calendar.selected}
+                          disabled={calendar.writeback || pending !== null}
+                          onChange={(event) =>
+                            void updateGoogleCalendar(calendar.id, event.target.checked)
+                          }
+                          className="h-4 w-4 accent-[var(--accent)] disabled:opacity-50"
+                        />
+                        <span className="min-w-0 flex-1 truncate">{calendar.summary}</span>
+                        {calendar.primary && (
+                          <span className="text-[11px] text-fg-subtle">Primary</span>
+                        )}
+                        {calendar.writeback && (
+                          <span className="text-[11px] text-fg-subtle">Write-back · excluded</span>
+                        )}
+                      </label>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
 
           <div className="border-t border-black/[0.06] pt-5">

@@ -23,7 +23,6 @@ name: horolog
 
 services:
   db:
-    cgroup_parent: horolog.slice
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: horolog
@@ -40,60 +39,53 @@ services:
       retries: 20
     restart: unless-stopped
 
-  codex-proxy:
-    cgroup_parent: horolog.slice
-    build:
-      context: ./codex-proxy
-    environment:
-      CODEX_PROXY_HOST: 0.0.0.0
-      CODEX_PROXY_PORT: 3466
-      CODEX_PROXY_DEFAULT_MODEL: gpt-5.5
-
-      # Auf dem Pi keine Modelle vorwärmen
-      CODEX_PROXY_INIT_POOL: "0"
-
-      # Nicht unnötig viele Codex-Prozesse auf dem Pi
-      CODEX_PROXY_POOL_MAX: "2"
-
-      # Horolog braucht keine Coding-/Shell-Rechte
-      CODEX_PROXY_SANDBOX: read-only
-      CODEX_PROXY_APPROVAL_POLICY: never
-
+  ollama:
+    image: ollama/ollama:latest
     volumes:
-      - codex-auth:/root/.codex
-
+      - ollama-models:/root/.ollama
+    ports:
+      - "127.0.0.1:11434:11434"
     healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "node -e \"fetch('http://127.0.0.1:3466/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""
-        ]
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
       interval: 10s
       timeout: 5s
-      retries: 10
-
+      retries: 12
     restart: unless-stopped
+    # Uncomment for GPU. CPU is fine — the model runs once per captured
+    # sentence, not once per re-plan.
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices: [{ driver: nvidia, count: 1, capabilities: [gpu] }]
 
+  # Pulls the model once, then exits. Separated from `ollama` so the server
+  # image stays stock and a re-pull never restarts the server.
+  ollama-pull:
+    image: ollama/ollama:latest
+    depends_on:
+      ollama: { condition: service_healthy }
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["sh", "-c", "ollama pull ${HOROLOG_LLM_MODEL:-qwen3:8b}"]
+    restart: "no"
 
   api:
-    cgroup_parent: horolog.slice
     build:
       context: .
       dockerfile: infra/Dockerfile.api
     depends_on:
       db: { condition: service_healthy }
-      codex-proxy: { condition: service_healthy }
+      ollama-pull: { condition: service_completed_successfully }
     environment:
       # Overridable so the SQLite fallback above (delete `db`, set this in
       # .env) actually works — it used to be hardcoded here, which made that
       # instruction a no-op.
       HOROLOG_DATABASE_URL: ${HOROLOG_DATABASE_URL:-postgresql+asyncpg://horolog:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/horolog}
       HOROLOG_LLM_PROVIDER: ${HOROLOG_LLM_PROVIDER:-openai}
-      HOROLOG_LLM_BASE_URL: ${HOROLOG_LLM_BASE_URL:-http://codex-proxy:3466/v1}
-      HOROLOG_LLM_MODEL: ${HOROLOG_LLM_MODEL:-gpt-6-luna}
-      HOROLOG_LLM_API_KEY: ${HOROLOG_LLM_API_KEY:-local}
-      HOROLOG_LLM_TIMEOUT_S: ${HOROLOG_LLM_TIMEOUT_S:-120}
-      HOROLOG_TIMEZONE: ${HOROLOG_TIMEZONE:-Europe/Berlin}
+      HOROLOG_LLM_BASE_URL: ${HOROLOG_LLM_BASE_URL:-http://ollama:11434/v1}
+      HOROLOG_LLM_MODEL: ${HOROLOG_LLM_MODEL:-qwen3:8b}
+      HOROLOG_LLM_API_KEY: ${HOROLOG_LLM_API_KEY:-}
+      HOROLOG_TIMEZONE: ${HOROLOG_TIMEZONE:-UTC}
       HOROLOG_HORIZON_DAYS: ${HOROLOG_HORIZON_DAYS:-21}
       HOROLOG_CORS_ORIGINS: '["http://localhost:3000"]'
       # Where a provider's consent screen sends the browser back to — the
@@ -111,8 +103,6 @@ services:
       HOROLOG_TODOIST_CLIENT_SECRET: ${HOROLOG_TODOIST_CLIENT_SECRET:-}
       HOROLOG_GITHUB_CLIENT_ID: ${HOROLOG_GITHUB_CLIENT_ID:-}
       HOROLOG_GITHUB_CLIENT_SECRET: ${HOROLOG_GITHUB_CLIENT_SECRET:-}
-
-      HOROLOG_CALENDAR_WRITEBACK_ENABLED: ${HOROLOG_CALENDAR_WRITEBACK_ENABLED:-false}
     volumes:
       - api-data:/app/data
     ports:
@@ -120,7 +110,6 @@ services:
     restart: unless-stopped
 
   web:
-    cgroup_parent: horolog.slice
     build:
       context: .
       dockerfile: infra/Dockerfile.web
@@ -139,4 +128,4 @@ services:
 volumes:
   db-data:
   api-data:
-  codex-auth:
+  ollama-models:

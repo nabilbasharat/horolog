@@ -949,6 +949,8 @@ function EventCard({
   getColorClasses,
   variant = "default",
   displayRange,
+  timelineView,
+  timelineWidthPercent = 100,
 }: {
   event: Event
   onEventClick: (event: Event) => void
@@ -957,6 +959,8 @@ function EventCard({
   getColorClasses: (color: string) => { bg: string; text: string }
   variant?: "default" | "compact" | "detailed" | "timeline"
   displayRange?: { start: Date; end: Date }
+  timelineView?: "day" | "week"
+  timelineWidthPercent?: number
 }) {
   const [isHovered, setIsHovered] = useState(false)
   const colorClasses = getColorClasses(event.color)
@@ -1010,6 +1014,10 @@ function EventCard({
     const visibleStart = displayRange?.start ?? event.startTime
     const visibleEnd = displayRange?.end ?? event.endTime
     const visibleMinutes = (visibleEnd.getTime() - visibleStart.getTime()) / 60_000
+    const isDayView = timelineView === "day"
+    const titleSize = isDayView ? "text-[14px] leading-[14px]" : "text-[12px] leading-[12px]"
+    const metadataSize = isDayView ? "text-[11px] leading-3" : "text-[10px] leading-3"
+    const showMetadata = visibleMinutes >= 45 && (isDayView || timelineWidthPercent >= 70)
     return (
       <div
         role="button"
@@ -1027,15 +1035,15 @@ function EventCard({
         title={`${event.title} · ${formatTime(visibleStart)} - ${formatTime(visibleEnd)}`}
         style={priorityStyle}
         className={cn(
-          "h-full w-full cursor-pointer overflow-hidden rounded-md border border-black/10 px-1 py-0 text-[10px] leading-3",
+          "h-full w-full cursor-pointer overflow-hidden rounded-md border border-black/15 px-1 py-0",
           bgClass,
           textClass,
           "hover:brightness-95",
         )}
       >
-        <div className="truncate font-semibold">{event.title}</div>
-        {visibleMinutes >= 45 && (
-          <div className={cn("tabular truncate text-[9px] leading-3", priority ? "text-fg-muted" : "opacity-80")}>
+        <div className={cn("truncate font-semibold", titleSize)}>{event.title}</div>
+        {showMetadata && (
+          <div className={cn("tabular truncate font-medium", metadataSize, priority ? "text-fg-muted" : "text-white/85")}>
             {formatTime(visibleStart)} - {formatTime(visibleEnd)}
           </div>
         )}
@@ -1417,6 +1425,8 @@ function WeekView({
                       onDragEnd={onDragEnd}
                       getColorClasses={getColorClasses}
                       variant="timeline"
+                      timelineView="week"
+                      timelineWidthPercent={positioned.widthPercent}
                       displayRange={{ start: positioned.visibleStart, end: positioned.visibleEnd }}
                     />
                   </div>
@@ -1507,6 +1517,7 @@ function DayView({
                 onDragEnd={onDragEnd}
                 getColorClasses={getColorClasses}
                 variant="timeline"
+                timelineView="day"
                 displayRange={{ start: positioned.visibleStart, end: positioned.visibleEnd }}
               />
             </div>

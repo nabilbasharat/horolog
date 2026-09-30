@@ -72,6 +72,7 @@ jobs:
           cache-dependency-path: apps/web/package-lock.json
 
       - run: npm ci || npm install
+      - run: npm run test:calendar-layout
       - run: npm run typecheck
       - run: npm run build
 

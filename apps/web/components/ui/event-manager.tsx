@@ -29,6 +29,11 @@ import {
 import { Glyph } from "@/app/components/Glyph"
 import { FILL, RULE } from "@/app/components/Grid"
 import type { IntentKind, Priority } from "@/app/lib/api"
+import {
+  CALENDAR_DAY_HEIGHT,
+  CALENDAR_PX_PER_HOUR,
+  layoutEventsForDay,
+} from "@/app/lib/calendar-layout"
 
 export interface Event {
   id: string
@@ -943,13 +948,15 @@ function EventCard({
   onDragEnd,
   getColorClasses,
   variant = "default",
+  displayRange,
 }: {
   event: Event
   onEventClick: (event: Event) => void
   onDragStart: (event: Event) => void
   onDragEnd: () => void
   getColorClasses: (color: string) => { bg: string; text: string }
-  variant?: "default" | "compact" | "detailed"
+  variant?: "default" | "compact" | "detailed" | "timeline"
+  displayRange?: { start: Date; end: Date }
 }) {
   const [isHovered, setIsHovered] = useState(false)
   const colorClasses = getColorClasses(event.color)
@@ -998,6 +1005,43 @@ function EventCard({
         <Glyph kind={event.kind} size={size} />
       </span>
     )
+
+  if (variant === "timeline") {
+    const visibleStart = displayRange?.start ?? event.startTime
+    const visibleEnd = displayRange?.end ?? event.endTime
+    const visibleMinutes = (visibleEnd.getTime() - visibleStart.getTime()) / 60_000
+    return (
+      <div
+        role="button"
+        tabIndex={0}
+        draggable
+        onDragStart={() => onDragStart(event)}
+        onDragEnd={onDragEnd}
+        onClick={() => onEventClick(event)}
+        onKeyDown={(keyboardEvent) => {
+          if (keyboardEvent.key === "Enter" || keyboardEvent.key === " ") {
+            keyboardEvent.preventDefault()
+            onEventClick(event)
+          }
+        }}
+        title={`${event.title} · ${formatTime(visibleStart)} - ${formatTime(visibleEnd)}`}
+        style={priorityStyle}
+        className={cn(
+          "h-full w-full cursor-pointer overflow-hidden rounded-md border border-black/10 px-1 py-0 text-[10px] leading-3",
+          bgClass,
+          textClass,
+          "hover:brightness-95",
+        )}
+      >
+        <div className="truncate font-semibold">{event.title}</div>
+        {visibleMinutes >= 45 && (
+          <div className={cn("tabular truncate text-[9px] leading-3", priority ? "text-fg-muted" : "opacity-80")}>
+            {formatTime(visibleStart)} - {formatTime(visibleEnd)}
+          </div>
+        )}
+      </div>
+    )
+  }
 
   if (variant === "compact") {
     return (
@@ -1290,80 +1334,97 @@ function WeekView({
 }) {
   const startOfWeek = new Date(currentDate)
   startOfWeek.setDate(currentDate.getDate() - currentDate.getDay())
-
   const weekDays = Array.from({ length: 7 }, (_, i) => {
     const day = new Date(startOfWeek)
     day.setDate(startOfWeek.getDate() + i)
     return day
   })
-
   const hours = Array.from({ length: 24 }, (_, i) => i)
 
-  const getEventsForDayAndHour = (date: Date, hour: number) => {
-    return events.filter((event) => {
-      const eventDate = new Date(event.startTime)
-      const eventHour = eventDate.getHours()
-      return (
-        eventDate.getDate() === date.getDate() &&
-        eventDate.getMonth() === date.getMonth() &&
-        eventDate.getFullYear() === date.getFullYear() &&
-        eventHour === hour
-      )
-    })
+  const handleDrop = (dropEvent: React.DragEvent<HTMLDivElement>, day: Date) => {
+    dropEvent.preventDefault()
+    const bounds = dropEvent.currentTarget.getBoundingClientRect()
+    const hour = Math.max(
+      0,
+      Math.min(23, Math.floor((dropEvent.clientY - bounds.top) / CALENDAR_PX_PER_HOUR)),
+    )
+    onDrop(day, hour)
   }
 
   return (
     <Card className="overflow-auto bg-white">
-      <div className="grid grid-cols-8 border-b">
-        <div className="border-r p-2 text-center text-xs font-medium sm:text-sm">Time</div>
-        {weekDays.map((day) => (
-          <div
-            key={day.toISOString()}
-            className="border-r p-2 text-center text-xs font-medium last:border-r-0 sm:text-sm"
-          >
-            <div className="hidden sm:block">{day.toLocaleDateString("en-US", { weekday: "short" })}</div>
-            <div className="sm:hidden">{day.toLocaleDateString("en-US", { weekday: "narrow" })}</div>
-            <div className="text-[10px] text-muted-foreground sm:text-xs">
-              {day.toLocaleDateString("en-US", { month: "short", day: "numeric" })}
-            </div>
-          </div>
-        ))}
-      </div>
-      <div className="grid grid-cols-8">
-        {hours.map((hour) => (
-          <React.Fragment key={`row-${hour}`}>
+      <div className="min-w-[900px]">
+        <div className="grid grid-cols-8 border-b">
+          <div className="border-r p-2 text-center text-xs font-medium sm:text-sm">Time</div>
+          {weekDays.map((day) => (
             <div
-              className="border-b border-r p-1 text-[10px] text-muted-foreground sm:p-2 sm:text-xs"
+              key={day.toISOString()}
+              className="border-r p-2 text-center text-xs font-medium last:border-r-0 sm:text-sm"
             >
-              {hour.toString().padStart(2, "0")}:00
+              <div className="hidden sm:block">{day.toLocaleDateString("en-US", { weekday: "short" })}</div>
+              <div className="sm:hidden">{day.toLocaleDateString("en-US", { weekday: "narrow" })}</div>
+              <div className="text-[10px] text-muted-foreground sm:text-xs">
+                {day.toLocaleDateString("en-US", { month: "short", day: "numeric" })}
+              </div>
             </div>
-            {weekDays.map((day) => {
-              const dayEvents = getEventsForDayAndHour(day, hour)
-              return (
-                <div
-                  key={`${day.toISOString()}-${hour}`}
-                  className="min-h-12 border-b border-r p-0.5 transition-colors hover:bg-accent/50 last:border-r-0 sm:min-h-16 sm:p-1"
-                  onDragOver={(e) => e.preventDefault()}
-                  onDrop={() => onDrop(day, hour)}
-                >
-                  <div className="space-y-1">
-                    {dayEvents.map((event) => (
-                      <EventCard
-                        key={event.id}
-                        event={event}
-                        onEventClick={onEventClick}
-                        onDragStart={onDragStart}
-                        onDragEnd={onDragEnd}
-                        getColorClasses={getColorClasses}
-                        variant="default"
-                      />
-                    ))}
+          ))}
+        </div>
+        <div className="grid grid-cols-8">
+          <div className="border-r">
+            {hours.map((hour) => (
+              <div
+                key={hour}
+                style={{ height: CALENDAR_PX_PER_HOUR }}
+                className="box-border border-b p-1 text-[10px] text-muted-foreground sm:p-2 sm:text-xs"
+              >
+                {hour.toString().padStart(2, "0")}:00
+              </div>
+            ))}
+          </div>
+          {weekDays.map((day) => {
+            const positionedEvents = layoutEventsForDay(events, day)
+            return (
+              <div
+                key={day.toISOString()}
+                className="relative border-r last:border-r-0"
+                style={{ height: CALENDAR_DAY_HEIGHT }}
+                onDragOver={(dropEvent) => dropEvent.preventDefault()}
+                onDrop={(dropEvent) => handleDrop(dropEvent, day)}
+              >
+                {hours.map((hour) => (
+                  <div
+                    key={hour}
+                    aria-hidden
+                    style={{ top: hour * CALENDAR_PX_PER_HOUR, height: CALENDAR_PX_PER_HOUR }}
+                    className="pointer-events-none absolute inset-x-0 border-b"
+                  />
+                ))}
+                {positionedEvents.map((positioned) => (
+                  <div
+                    key={`${positioned.event.id}-${positioned.visibleStart.toISOString()}`}
+                    style={{
+                      top: positioned.top,
+                      height: positioned.height,
+                      left: `${positioned.leftPercent}%`,
+                      width: `${positioned.widthPercent}%`,
+                    }}
+                    className="absolute z-10 box-border px-0.5"
+                  >
+                    <EventCard
+                      event={positioned.event}
+                      onEventClick={onEventClick}
+                      onDragStart={onDragStart}
+                      onDragEnd={onDragEnd}
+                      getColorClasses={getColorClasses}
+                      variant="timeline"
+                      displayRange={{ start: positioned.visibleStart, end: positioned.visibleEnd }}
+                    />
                   </div>
-                </div>
-              )
-            })}
-          </React.Fragment>
-        ))}
+                ))}
+              </div>
+            )
+          })}
+        </div>
       </div>
     </Card>
   )
@@ -1388,53 +1449,69 @@ function DayView({
   getColorClasses: (color: string) => { bg: string; text: string }
 }) {
   const hours = Array.from({ length: 24 }, (_, i) => i)
+  const positionedEvents = layoutEventsForDay(events, currentDate)
 
-  const getEventsForHour = (hour: number) => {
-    return events.filter((event) => {
-      const eventDate = new Date(event.startTime)
-      const eventHour = eventDate.getHours()
-      return (
-        eventDate.getDate() === currentDate.getDate() &&
-        eventDate.getMonth() === currentDate.getMonth() &&
-        eventDate.getFullYear() === currentDate.getFullYear() &&
-        eventHour === hour
-      )
-    })
+  const handleDrop = (dropEvent: React.DragEvent<HTMLDivElement>) => {
+    dropEvent.preventDefault()
+    const bounds = dropEvent.currentTarget.getBoundingClientRect()
+    const hour = Math.max(
+      0,
+      Math.min(23, Math.floor((dropEvent.clientY - bounds.top) / CALENDAR_PX_PER_HOUR)),
+    )
+    onDrop(currentDate, hour)
   }
 
   return (
     <Card className="overflow-auto bg-white">
-      <div className="space-y-0">
-        {hours.map((hour) => {
-          const hourEvents = getEventsForHour(hour)
-          return (
+      <div className="grid min-w-[640px] grid-cols-[5rem_minmax(0,1fr)]">
+        <div className="border-r">
+          {hours.map((hour) => (
             <div
               key={hour}
-              className="flex border-b last:border-b-0"
-              onDragOver={(e) => e.preventDefault()}
-              onDrop={() => onDrop(currentDate, hour)}
+              style={{ height: CALENDAR_PX_PER_HOUR }}
+              className="box-border border-b p-2 text-xs text-muted-foreground sm:text-sm"
             >
-              <div className="w-14 flex-shrink-0 border-r p-2 text-xs text-muted-foreground sm:w-20 sm:p-3 sm:text-sm">
-                {hour.toString().padStart(2, "0")}:00
-              </div>
-              <div className="min-h-16 flex-1 p-1 transition-colors hover:bg-accent/50 sm:min-h-20 sm:p-2">
-                <div className="space-y-2">
-                  {hourEvents.map((event) => (
-                    <EventCard
-                      key={event.id}
-                      event={event}
-                      onEventClick={onEventClick}
-                      onDragStart={onDragStart}
-                      onDragEnd={onDragEnd}
-                      getColorClasses={getColorClasses}
-                      variant="detailed"
-                    />
-                  ))}
-                </div>
-              </div>
+              {hour.toString().padStart(2, "0")}:00
             </div>
-          )
-        })}
+          ))}
+        </div>
+        <div
+          className="relative"
+          style={{ height: CALENDAR_DAY_HEIGHT }}
+          onDragOver={(dropEvent) => dropEvent.preventDefault()}
+          onDrop={handleDrop}
+        >
+          {hours.map((hour) => (
+            <div
+              key={hour}
+              aria-hidden
+              style={{ top: hour * CALENDAR_PX_PER_HOUR, height: CALENDAR_PX_PER_HOUR }}
+              className="pointer-events-none absolute inset-x-0 border-b"
+            />
+          ))}
+          {positionedEvents.map((positioned) => (
+            <div
+              key={`${positioned.event.id}-${positioned.visibleStart.toISOString()}`}
+              style={{
+                top: positioned.top,
+                height: positioned.height,
+                left: `${positioned.leftPercent}%`,
+                width: `${positioned.widthPercent}%`,
+              }}
+              className="absolute z-10 box-border px-0.5"
+            >
+              <EventCard
+                event={positioned.event}
+                onEventClick={onEventClick}
+                onDragStart={onDragStart}
+                onDragEnd={onDragEnd}
+                getColorClasses={getColorClasses}
+                variant="timeline"
+                displayRange={{ start: positioned.visibleStart, end: positioned.visibleEnd }}
+              />
+            </div>
+          ))}
+        </div>
       </div>
     </Card>
   )
